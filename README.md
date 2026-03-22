@@ -156,4 +156,3 @@ test_patterns()
 
 ---
 
-*Built with [PyMuPDF](https://pymupdf.readthedocs.io/). For assistance: founder@accrevise.com*
