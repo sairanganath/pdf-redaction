@@ -2,6 +2,7 @@ import fitz  # PyMuPDF
 import re
 import json
 import os
+import sys
 from typing import List, Optional, Tuple
 
 # =========================
@@ -284,14 +285,21 @@ def redact_pdf_smart(
         patterns += [p for p in extra_patterns if isinstance(p, str)]
 
     redacted_count = 0
+    page_counts = {}
+
+    print(f"[INFO] Input  : {input_file}")
+    print(f"[INFO] Output : {output_file}")
+    print(f"[INFO] Patterns loaded: {len(patterns)} | Name detection: {include_names}")
 
     try:
         doc = fitz.open(input_file)
-        print(f"Opened: {input_file} | Pages: {len(doc)}")
+        print(f"[INFO] Opened successfully | Pages: {len(doc)}")
 
         for page_num in range(len(doc)):
             page = doc[page_num]
+            page_hits = 0
             text_dict = page.get_text("dict")
+            print(f"[PAGE {page_num + 1}] Scanning...")
 
             for block in text_dict.get("blocks", []):
                 for line in block.get("lines", []):
@@ -330,49 +338,68 @@ def redact_pdf_smart(
                     if not all_hits:
                         continue
 
-                    # Fallback: only if the line is *mostly* sensitive, wipe full line
-                    total_sensitive_chars = sum(e - s for (s, e) in all_hits)
-                    clean_len = len(line_text.strip())
-                    mostly_sensitive = clean_len > 0 and (total_sensitive_chars / clean_len) >= 0.6
+                    print(f"  [MATCH] Line : {line_text.strip()!r}")
+                    for s, e in sensitive_spans:
+                        print(f"    [SENSITIVE] {line_text[s:e]!r}")
+                    for s, e, name in name_hits:
+                        print(f"    [NAME]      {name!r}")
 
-                    if mostly_sensitive:
-                        boxes = [b for (_, _, b, _) in span_ranges if b]
-                        if boxes:
-                            x0 = min(b[0] for b in boxes)
-                            y0 = min(b[1] for b in boxes)
-                            x1 = max(b[2] for b in boxes)
-                            y1 = max(b[3] for b in boxes)
-                            add_blackout(page, (x0, y0, x1, y1))
-                            redacted_count += 1
+                    # Compute the line's bounding box to clip searches to this line only
+                    line_boxes = [b for (_, _, b, _) in span_ranges if b]
+                    if not line_boxes:
                         continue
+                    clip_rect = fitz.Rect(
+                        min(b[0] for b in line_boxes) - 5,
+                        min(b[1] for b in line_boxes) - 2,
+                        max(b[2] for b in line_boxes) + 5,
+                        max(b[3] for b in line_boxes) + 2,
+                    )
 
-                    # Targeted redaction: map each (start,end) to union of intersecting span boxes
+                    # Targeted redaction: search for the exact matched text to get its
+                    # precise bbox — preserves labels, only blacks out values.
                     for (start_i, end_i) in all_hits:
-                        boxes = []
-                        for sp_start, sp_end, bbox, _ in span_ranges:
-                            if bbox and not (sp_end <= start_i or sp_start >= end_i):
-                                boxes.append(bbox)
-                        if boxes:
-                            x0 = min(b[0] for b in boxes)
-                            y0 = min(b[1] for b in boxes)
-                            x1 = max(b[2] for b in boxes)
-                            y1 = max(b[3] for b in boxes)
-                            add_blackout(page, (x0, y0, x1, y1))
-                            redacted_count += 1
+                        matched_text = line_text[start_i:end_i].strip()
+                        if not matched_text or len(matched_text) < 2:
+                            continue
+                        rects = page.search_for(matched_text, clip=clip_rect)
+                        if rects:
+                            for rect in rects:
+                                add_blackout(page, rect)
+                                redacted_count += 1
+                                page_hits += 1
+                        else:
+                            print(f"    [FALLBACK] No rect found for {matched_text!r}, using span bbox")
+                            # Fallback: union of intersecting span bboxes
+                            boxes = []
+                            for sp_start, sp_end, bbox, _ in span_ranges:
+                                if bbox and not (sp_end <= start_i or sp_start >= end_i):
+                                    boxes.append(bbox)
+                            if boxes:
+                                x0 = min(b[0] for b in boxes)
+                                y0 = min(b[1] for b in boxes)
+                                x1 = max(b[2] for b in boxes)
+                                y1 = max(b[3] for b in boxes)
+                                add_blackout(page, (x0, y0, x1, y1))
+                                redacted_count += 1
+                                page_hits += 1
 
-        # Apply redactions (version-proof)
+            page_counts[page_num + 1] = page_hits
+            print(f"[PAGE {page_num + 1}] Redactions applied: {page_hits}")
+
+        print(f"\n[INFO] Applying redactions to document...")
         apply_all_redactions(doc)
-
-        # Save
+        print(f"[INFO] Saving to: {output_file}")
         doc.save(output_file)
         doc.close()
-        print(f"\nTotal items redacted: {redacted_count}")
-        print(f"Saved: {output_file}")
-        print("SUCCESS")
+        print(f"\n[DONE] Total redactions: {redacted_count}")
+        print(f"[DONE] Per-page summary: {page_counts}")
+        print(f"[DONE] Saved: {output_file}")
         return True
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # =========================
@@ -403,12 +430,24 @@ def test_patterns():
         print(f"{s!r} => sensitive_spans={sens} names={names}")
 
 # =========================
-# Ready message
+# CLI entry point
 # =========================
 
-print("Fixed PDF Redactor Ready!")
-print("Functions available:")
-print("- quick_redact('filename.pdf')")
-print("- smart_redact_file('filename.pdf', extra_patterns=[r'YOUR_REGEX'])")
-print("- test_patterns()  # Test pattern recognition")
-print("\nTry: quick_redact('your example.pdf')")
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python redact_india.py <file.pdf> [output.pdf]")
+        sys.exit(1)
+
+    input_pdf = sys.argv[1]
+    output_pdf = sys.argv[2] if len(sys.argv) > 2 else None
+
+    if not input_pdf.lower().endswith(".pdf"):
+        print(f"Error: '{input_pdf}' is not a PDF file.")
+        sys.exit(1)
+
+    if not os.path.exists(input_pdf):
+        print(f"Error: File not found: '{input_pdf}'")
+        sys.exit(1)
+
+    success = quick_redact(input_pdf, output_file=output_pdf)
+    sys.exit(0 if success else 1)
